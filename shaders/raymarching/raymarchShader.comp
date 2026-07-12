@@ -1,0 +1,223 @@
+#version 450 //specify version
+
+
+/************/
+/*INPUT DATA*/
+/************/
+
+//UBO for camera & light information
+layout (binding = 0) uniform UniformBufferObject {
+    mat4 view;
+    mat4 proj;
+    vec3 lightPos;
+    vec3 viewPos;
+    vec2 resolution;
+    vec4 params;
+} ubo;
+
+//hdr storage image
+layout(rgba16f, binding = 1) uniform image2D hdrImage;
+
+/*compute-only declaration related to the compute space (IMPORTANT!!!)
+ *defines the number invocations of this comptue shader in the current work group (local part of the compute space)
+*/
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+/*************/
+/*OUTPUT DATA*/
+/*************/
+
+/***************************/
+/*FRAGMENT SHADER CONSTANTS*/
+/***************************/
+
+/******************/
+/*HELPER FUNCTIONS*/
+/******************/
+
+//DE for fractal
+float deFractal(vec3 point, float polarOffset, float power) {
+    vec3 z  = point;
+    float r;
+    float dr = 1.0;
+
+    for (int n=0; n<212; n++) { //# of iterations -> more for greater detail
+        r = length(z);
+        if (r > 2.0) break; //break off if point diverges
+
+        //convert/utilize spherical coordinates (make sure to match our camera setup)
+        float cosPhi = clamp(-z.y / r, -1.0, 1.0);
+        float phi = acos(cosPhi) + polarOffset; //offset for the "unfolding" animated effect
+        float theta = atan(z.z, z.x);
+        
+        float derivpow = pow(r, power - 1.0);
+        dr = derivpow * power * dr + 1.0; //estimate the derivative for Hubbard_Douady potential
+
+        //use the Mandelbrot equation: z = z^k + c
+        phi = phi * power; //complex exponentiation represents multiplication of the vector angle
+        theta = theta * power;
+
+        //convert back to cartesian coords and add sample point c (using our coordinate system -> matches ArcballCam.hpp)
+        z = (derivpow * r) * vec3(sin(theta) * sin(phi), -cos(phi), -cos(theta) * sin(phi));
+
+        z += point;
+    }
+
+    //return the estimate of the distance to the fractal
+    return 0.5*log(r)*r/dr;
+}
+
+//scene map function (combines SDF's)
+float map(vec3 point) {
+
+    //check the powerLevel so we render the correct version
+    if (int(ubo.params.x) > 1) {
+        return deFractal(point, (ubo.params.z * 0.15), int(ubo.params.x)); //mandelbulb with power level 1
+    } else {
+        return deFractal(point, (ubo.params.z * 0.15), 2.0 + mod(ubo.params.z * 0.1, 10)); //fractal that changes from 2-10 power through time
+    }
+}
+
+//finitie-difference normal estimation function
+vec3 calcNormal(vec3 p) {
+    float e = 0.0005; //make epsilon value ->used to probe the DE around point p
+    vec2 h = vec2(e, 0.0); //create a vec2 so we can construct offset vector using swizzling
+
+    //approximate gradient using offset
+    return normalize(vec3(
+        //central difference gradient
+        map(p + h.xyy) - map(p - h.xyy), //h.xyy -> (e, 0, 0)
+        map(p + h.yxy) - map(p - h.yxy), //h.yxy -> (0, e, 0)
+        map(p + h.yyx) - map(p - h.yyx)  //h.yyx -> (0, 0, e)
+    ));
+}
+
+//shadow calculation function
+float shadow(vec3 rayOrigin, vec3 rayDirection, float maxDist) {
+    float t = 0.0005; //start with small epislon to prevent any discrepencies
+    float res = 1.0;
+
+    //iterate our # of steps (same as inside main)
+    for (int i=0; i<212; i++) {
+        vec3 point = rayOrigin + rayDirection * t;
+        float h = map(point);
+
+        //check for collisions
+        if (h < ubo.params.y) {
+            return 0.0; //fully in shadow
+        }
+
+        res = min(res, 4.0 * h / t); //softness factor
+        t += h; //step size
+
+        //check if we have gone beyond our maximum distance
+        if (t >= maxDist) {
+            break;
+        }
+    }
+
+    return clamp(res, 0.0, 1.0); //fully lit
+}
+
+
+
+/************/
+/*BEGIN MAIN*/
+/************/
+void main() {
+    //begin by grabbing the current pixel -> unique across ALL work groups
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    //quick dimension/pixel check
+    if (pixel.x >= int(ubo.resolution.x) || pixel.y >= int(ubo.resolution.y))
+        return; //skips threads that would write out of bounds
+
+    //map UV to [-1, 1] and fix aspect ratio
+    vec2 uv = (vec2(pixel) / ubo.resolution) * 2.0 - 1.0;
+    uv.x *= ubo.resolution.x / ubo.resolution.y;
+
+    //camera/ray setup -> need to go from screen to clip to view to world space (opposite of graphics pipeline)
+    //first convert UV to clip space
+    vec4 clip = vec4(uv, -1.0, 1.0);
+
+    //clip to view space
+    vec4 viewRay = ubo.proj  * clip;
+    viewRay /= viewRay.w; //perspective division
+    vec3 rayDirView = normalize(viewRay.xyz);
+    
+    //view to world space
+    vec3 rayDirection = normalize((ubo.view * vec4(rayDirView, 0.0)).xyz); //our ray direction calculated with camera data
+    vec3 rayOrigin = ubo.viewPos;  //camera origin
+    float t = 0.0;                 //distance traveled of our ray
+    float maxDist = 25.0;          //maximum t-value (used for cut-offs in iteration)
+    bool hit = false;              //bool for knowing if we hit something or not
+
+    for (int i=0; i<212; i++) {
+        vec3 point = rayOrigin + rayDirection * t;
+        float closestDistance = map(point);
+
+        //check if we hit something
+        if (closestDistance < ubo.params.y) {
+            //if so set hit to true so we know to color this pixel
+            hit = true;
+            break;
+        }
+
+        t += closestDistance; //accumulate our distance traveled
+
+        //check if we have gone beyond our maximum distance
+        if (t >= maxDist) {
+            //if so we break to save computation
+            break;
+        }
+    }
+
+    //begin our pixel's color calculation
+    vec3 color = vec3(0.0); //default is black (black backgound)
+
+    //check our hit bool to determine if this pixel was background or actually hit an object
+    if (hit == true) {
+        //begin color calculations
+        vec3 point = rayOrigin + rayDirection * t; //get the point of the intersection
+        //get vector values needed
+        vec3 lightDir = normalize(ubo.lightPos - point);
+        vec3 viewDir = normalize(ubo.viewPos - point);
+        float dist = length(ubo.lightPos - point);
+        float attenuation = 1.0 / (1.0 + 0.1 * dist + 0.01 * dist * dist);
+
+        vec3 normal = calcNormal(point); // get the normal of the intersection
+
+        //ambient
+        vec3 albedo = vec3(0.0, 0.0, 0.0);
+        if (ubo.params.w < 1.0) {
+            albedo = 0.5 + 0.5 * normal; //generate color based off of normalized normal -> values are [0, 1]
+        } else if (ubo.params.w < 1.5) {
+            albedo = point + point * normal; //generate color based of mixing normal and hit position
+        } else {
+            albedo = point * normal; //generate color based of mixing normal and hit position 
+        }
+        vec3 ambient = 0.20 * albedo; //can tweak this as needed
+
+        //diffuse
+        float diff = max(dot(normal, lightDir), 0.0);
+        vec3 diffuse = (diff * albedo) * attenuation;
+
+        //specular
+        float shininess = 4.8; //can tweak this as needed        
+        vec3 reflectDir = reflect(-lightDir, normal);
+        float spec = pow(max(dot(viewDir, reflectDir), 0.0), shininess);
+        vec3 specular = (spec * vec3(0.8)) * attenuation;
+
+        //shadows
+        vec3 shadowOrigin = point + normal * 0.0005; //bias to prevent self intersection
+        float shadowFactor = shadow(shadowOrigin, lightDir, dist);
+
+        //final color combining ambient + diffuse + specular + shadows
+        color = vec3(ambient + shadowFactor * (diffuse + specular));            
+
+    }
+
+    //finally output our pixel's calculated color to the hdr storage image
+    imageStore(hdrImage, pixel, vec4(color, 1.0));
+ 
+}
